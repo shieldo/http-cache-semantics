@@ -1,246 +1,212 @@
-#[macro_use(lazy_static)]
-extern crate lazy_static;
-extern crate serde_json;
-extern crate chrono;
+//! Determines whether a given HTTP response can be cached and whether a cached response can be
+//! reused, following the rules specified in [RFC 7234](https://httpwg.org/specs/rfc7234.html).
 
-#[allow(dead_code)]
-mod http_cache_semantics {
-    use std::collections::{HashMap, HashSet};
-    use std::string::String;
-    use serde_json::{json, Value};
-    use chrono::prelude::*;
+#![warn(missing_docs)]
+// TODO: turn these warnings back on once everything is implemented
+#![allow(unused_variables)]
 
-    lazy_static! {
-        static ref STATUS_CODE_CACHEABLE_BY_DEFAULT: HashSet<i32> = {
-            let mut set = HashSet::new();
-            set.insert(200);
-            set.insert(203);
-            set.insert(204);
-            set.insert(206);
-            set.insert(300);
-            set.insert(301);
-            set.insert(404);
-            set.insert(405);
-            set.insert(410);
-            set.insert(414);
-            set.insert(501);
+use http::request::Parts as Request;
+use http::response::Parts as Response;
+use lazy_static::lazy_static;
+use std::collections::HashSet;
 
-            return set;
-        };
+lazy_static! {
+    static ref STATUS_CODE_CACHEABLE_BY_DEFAULT: HashSet<i32> = {
+        let mut set = HashSet::new();
+        set.insert(200);
+        set.insert(203);
+        set.insert(204);
+        set.insert(206);
+        set.insert(300);
+        set.insert(301);
+        set.insert(404);
+        set.insert(405);
+        set.insert(410);
+        set.insert(414);
+        set.insert(501);
+        return set;
+    };
+}
+
+lazy_static! {
+    static ref UNDERSTOOD_STATUSES: HashSet<i32> = {
+        let mut set = HashSet::new();
+        set.insert(200);
+        set.insert(203);
+        set.insert(204);
+        set.insert(300);
+        set.insert(301);
+        set.insert(302);
+        set.insert(303);
+        set.insert(307);
+        set.insert(308);
+        set.insert(404);
+        set.insert(405);
+        set.insert(410);
+        set.insert(414);
+        set.insert(501);
+        return set;
+    };
+}
+
+lazy_static! {
+    static ref HOP_BY_HOP_HEADERS: HashSet<&'static str> = {
+        let mut set = HashSet::new();
+        set.insert("date");
+        set.insert("connection");
+        set.insert("keep-alive");
+        set.insert("proxy-authentication");
+        set.insert("proxy-authorization");
+        set.insert("te");
+        set.insert("trailer");
+        set.insert("transfer-encoding");
+        set.insert("upgrade");
+        return set;
+    };
+}
+
+lazy_static! {
+    static ref EXCLUDED_FROM_REVALIDATION_UPDATE: HashSet<&'static str> = {
+        let mut set = HashSet::new();
+        set.insert("content-length");
+        set.insert("content-encoding");
+        set.insert("transfer-encoding");
+        set.insert("content-range");
+        return set;
+    };
+}
+
+/// Holds configuration options which control the behavior of the cache and are independent of
+/// any specific request or response.
+#[derive(Debug, Clone)]
+pub struct CacheOptions {
+    /// If `shared` is `true` (default), then the response is evaluated from a perspective of a
+    /// shared cache (i.e. `private` is not cacheable and `s-maxage` is respected). If `shared`
+    /// is `false`, then the response is evaluated from a perspective of a single-user cache
+    /// (i.e. `private` is cacheable and `s-maxage` is ignored). `shared: true` is recommended
+    /// for HTTP clients.
+    pub shared: bool,
+
+    /// If `ignore_cargo_cult` is `true`, common anti-cache directives will be completely
+    /// ignored if the non-standard `pre-check` and `post-check` directives are present. These
+    /// two useless directives are most commonly found in bad StackOverflow answers and PHP's
+    /// "session limiter" defaults.
+    pub ignore_cargo_cult: bool,
+
+    /// If `trust_server_date` is `false`, then server's `Date` header won't be used as the
+    /// base for `max-age`. This is against the RFC, but it's useful if you want to cache
+    /// responses with very short `max-age`, but your local clock is not exactly in sync with
+    /// the server's.
+    pub trust_server_date: bool,
+
+    /// `cache_heuristic` is a fraction of response's age that is used as a fallback
+    /// cache duration. The default is 0.1 (10%), e.g. if a file hasn't been modified for 100
+    /// days, it'll be cached for 100*0.1 = 10 days.
+    pub cache_heuristic: f32,
+
+    /// `immutable_min_time_to_live` is a number of seconds to assume as the default time to
+    /// cache responses with `Cache-Control: immutable`. Note that per RFC these can become
+    /// stale, so `max-age` still overrides the default.
+    pub immutable_min_time_to_live: u32,
+
+    // Allow more fields to be added later without breaking callers.
+    _hidden: (),
+}
+
+impl Default for CacheOptions {
+    fn default() -> Self {
+        CacheOptions {
+            shared: true,
+            ignore_cargo_cult: false,
+            trust_server_date: true,
+            cache_heuristic: 0.1, // 10% matches IE
+            immutable_min_time_to_live: 86400,
+            _hidden: (),
+        }
     }
+}
 
-    lazy_static! {
-        static ref UNDERSTOOD_STATUSES: HashSet<i32> = {
-            let mut set = HashSet::new();
-            set.insert(200);
-            set.insert(203);
-            set.insert(204);
-            set.insert(300);
-            set.insert(301);
-            set.insert(302);
-            set.insert(303);
-            set.insert(307);
-            set.insert(308);
-            set.insert(404);
-            set.insert(405);
-            set.insert(410);
-            set.insert(414);
-            set.insert(501);
+/// Identifies when responses can be reused from a cache, taking into account HTTP RFC 7234 rules
+/// for user agents and shared caches. It's aware of many tricky details such as the Vary header,
+/// proxy revalidation, and authenticated responses.
+#[derive(Debug)]
+pub struct CachePolicy;
 
-            return set;
-        };
+impl CacheOptions {
+    /// Cacheability of an HTTP response depends on how it was requested, so both request and
+    /// response are required to create the policy.
+    pub fn policy_for(&self, request: &Request, response: &Response) -> CachePolicy {
+        CachePolicy
     }
+}
 
-    lazy_static! {
-        static ref HOP_BY_HOP_HEADERS: HashSet<&'static str> = {
-            let mut set = HashSet::new();
-            set.insert("date");
-            set.insert("connection");
-            set.insert("keep-alive");
-            set.insert("proxy-authentication");
-            set.insert("proxy-authorization");
-            set.insert("te");
-            set.insert("trailer");
-            set.insert("transfer-encoding");
-            set.insert("upgrade");
-
-            return set;
-        };
-    }
-
-    lazy_static! {
-        static ref EXCLUDED_FROM_REVALIDATION_UPDATE: HashSet<&'static str> = {
-            let mut set = HashSet::new(); 
-            set.insert("content-length");
-            set.insert("content-encoding");
-            set.insert("transfer-encoding");
-            set.insert("content-range");
-
-            return set;
-        };
-    }
-
-    fn parse_cache_control() -> () {
+impl CachePolicy {
+    /// Returns `true` if the response can be stored in a cache. If it's `false` then you MUST NOT
+    /// store either the request or the response.
+    pub fn is_storable(&self) -> bool {
         unimplemented!();
     }
 
-    fn format_cache_control() -> () {
+    /// Returns approximate time in _milliseconds_ until the response becomes stale (i.e. not
+    /// fresh).
+    ///
+    /// After that time (when `time_to_live() <= 0`) the response might not be usable without
+    /// revalidation. However, there are exceptions, e.g. a client can explicitly allow stale
+    /// responses, so always check with `is_cached_response_fresh()`.
+    pub fn time_to_live(&self) -> u32 {
         unimplemented!();
     }
 
-    #[derive(Debug)]
-    pub struct CachePolicy {
-        request: Value,
-        response: Value,
-
-        // optionals
-        shared: Option<bool>,
-        ignore_cargo_cult: Option<bool>,
-        trust_server_date: Option<bool>,
-        cache_heuristic: Option<bool>,
-        immutable_min_time_to_live: Option<i32>,
-
-        // tbd
-        // response_time: String,
-        // status: i32,
-        // response_cache_control: String,
-        // method: String,
-        // url: String,
-        // host: String,
-        // no_authorization: bool,
-        // request_cache_control: String,
+    /// Returns whether the cached response is still fresh in the context of the new request.
+    ///
+    /// If it returns `true`, then the given request matches the original response this cache
+    /// policy has been created with, and the response can be reused without contacting the server.
+    ///
+    /// If it returns `false`, then the response may not be matching at all (e.g. it's for a
+    /// different URL or method), or may require to be refreshed first. Either way, the new
+    /// request's headers will have been updated for sending it to the origin server.
+    pub fn is_cached_response_fresh(
+        &self,
+        new_request: &mut Request,
+        cached_response: &Response,
+    ) -> bool {
+        unimplemented!();
     }
 
-    impl CachePolicy {
-        pub fn new(request: Value, response: Value) -> Self {
-            CachePolicy {
-                request: request,
-                response: response,
-                shared: None,
-                cache_heuristic: None,
-                immutable_min_time_to_live: None,
-                ignore_cargo_cult: None,
-                trust_server_date: None,
-            }
-        }
+    /// Use this method to update the policy state after receiving a new response from the origin
+    /// server. The updated `CachePolicy` should be saved to the cache along with the new response.
+    ///
+    /// Returns whether the cached response body is still valid. If `true`, then a valid 304 Not
+    /// Modified response has been received, and you can reuse the old cached response body. If
+    /// `false`, you should use new response's body (if present), or make another request to the
+    /// origin server without any conditional headers (i.e. don't use `is_cached_response_fresh`
+    /// this time) to get the new resource.
+    pub fn is_cached_response_valid(
+        &mut self,
+        new_request: &Request,
+        cached_response: &Response,
+        new_response: &Response,
+    ) -> bool {
+        unimplemented!();
+    }
 
-        pub fn with_shared(mut self, value: bool) -> CachePolicy {
-            self.shared = Some(value);
-            self
-        }
-
-        pub fn with_ignored_cargo_cult(mut self, value: bool) -> CachePolicy {
-            self.ignore_cargo_cult = Some(value);
-            self
-        }
-
-        pub fn with_trust_server_date(mut self, value: bool) -> CachePolicy {
-            self.trust_server_date = Some(value);
-            self
-        }
-
-        pub fn with_immutable_min_time_to_live(mut self, value: i32) -> CachePolicy {
-            self.immutable_min_time_to_live = Some(value);
-            self
-        }
-
-        pub fn now() -> String {
-            return Utc::now().to_string();
-        }
-
-        pub fn is_storable(&self) -> bool {
-            unimplemented!();
-        }
-
-        fn has_explicit_expiration(&self) {
-            unimplemented!();
-        }
-
-        fn assert_request_has_headers(&self, request: String) {
-            unimplemented!();
-        }
-
-        pub fn satisfies_without_revalidation(&self, request: Value) -> bool {
-            unimplemented!();
-        }
-
-        fn request_matches(&self, request: String, allow_head_method: bool) {
-            unimplemented!();
-        }
-
-        fn allows_storing_authenticated(&self) {
-            unimplemented!();
-        }
-
-        fn vary_matches(&self, request: String) -> bool {
-            unimplemented!();
-        }
-
-        fn copy_without_hop_by_hop_headers(&self, in_headers: HashMap<String, String>) -> HashMap<String, String> {
-            unimplemented!();
-        }
-
-        pub fn response_headers(&self) -> Value {
-            unimplemented!();
-        }
-
-        pub fn date(&self) {
-            unimplemented!();
-        }
-
-        fn server_date(&self) {
-            unimplemented!();
-        }
-
-        pub fn age(&self) -> i32 {
-            unimplemented!();
-        }
-
-        fn age_value(&self) {
-            unimplemented!();
-        }
-        
-        pub fn max_age(&self) -> i32 {
-            unimplemented!();
-        }
-
-        pub fn time_to_live(&self) -> i32 {
-            unimplemented!();
-        }
-
-        pub fn is_stale(&self) -> bool {
-            unimplemented!();
-        }
-
-        pub fn from_object(object: HashMap<String, String>) -> CachePolicy {
-            unimplemented!();
-        }
-
-        pub fn to_object(&self) -> HashMap<String, String> {
-            unimplemented!();
-        }
-
-        pub fn revalidation_headers(&self, incoming_request: String) -> HashMap<String, String> {
-            unimplemented!();
-        }
-
-        pub fn revalidated_policy(&self, request: String, response: HashMap<String, String>) -> HashMap<String, String> {
-            unimplemented!();
-        }
+    /// Updates and filters the response headers for a cached response before returning it to a
+    /// client. This function is necessary, because proxies MUST always remove hop-by-hop headers
+    /// (such as TE and Connection) and update response's Age to avoid doubling cache time.
+    pub fn update_response_headers(&self, headers: &mut Response) {
+        unimplemented!();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    extern crate serde_json;
-    use crate::http_cache_semantics::CachePolicy;
-    use serde_json::{json, Value};
+    use super::*;
     use chrono::prelude::*;
-    use std::string::String;
+    use serde_json::{json, Value};
     use std::collections::HashMap;
     use std::collections::HashSet;
-    use super::*;
-    
+    use std::string::String;
+
     fn assert_cached(should_put: bool, response_code: i32) {
         let expected_response_code = response_code;
 
@@ -267,14 +233,11 @@ mod tests {
             "headers": {}
         });
 
-        let policy = CachePolicy::new(
-            request,
-            response
-        ).with_shared(false);
+        let policy = CachePolicy::new(request, response).with_shared(false);
 
         assert_eq!(should_put, policy.is_storable());
     }
-    
+
     #[test]
     fn test_ok_http_response_caching_by_response_code() {
         assert_cached(false, 100);
@@ -287,7 +250,7 @@ mod tests {
         assert_cached(true, 204);
         assert_cached(false, 205);
         // 206: electing to not cache partial responses
-        assert_cached(false, 206); 
+        assert_cached(false, 206);
         assert_cached(false, 207);
         assert_cached(true, 300);
         assert_cached(true, 301);
@@ -308,7 +271,7 @@ mod tests {
         assert_cached(false, 408);
         assert_cached(false, 409);
         // 410: the HTTP spec permits caching 410s, but the RI doesn't
-        assert_cached(true, 410); 
+        assert_cached(true, 410);
         assert_cached(false, 411);
         assert_cached(false, 412);
         assert_cached(false, 413);
@@ -326,7 +289,7 @@ mod tests {
         assert_cached(false, 505);
         assert_cached(false, 506);
     }
-    
+
     #[test]
     fn test_default_expiration_date_fully_cached_for_less_than_24_hours() {
         let policy = CachePolicy::new(
@@ -337,12 +300,13 @@ mod tests {
                     "date": format_date(-5, 1),
                 },
                 "body": "A"
-            })
-        ).with_shared(false);   
+            }),
+        )
+        .with_shared(false);
 
         assert!(policy.time_to_live() > 4000);
     }
-    
+
     #[test]
     fn test_default_expiration_date_fully_cached_for_more_than_24_hours() {
         let policy = CachePolicy::new(
@@ -353,13 +317,14 @@ mod tests {
                     "date": format_date(-5, 3600 * 24),
                 },
                 "body": "A"
-            })
-        ).with_shared(false);
+            }),
+        )
+        .with_shared(false);
 
         assert!(policy.max_age() >= 10 * 3600 * 24);
         assert!(policy.time_to_live() + 1000 >= 5 * 3600 * 24);
     }
-    
+
     #[test]
     fn test_max_age_in_the_past_with_date_header_but_no_last_modified_header() {
         // Chrome interprets max-age relative to the local clock. Both our cache
@@ -371,12 +336,13 @@ mod tests {
                     "date": format_date(-120, 1),
                     "cache-control": "max-age=60",
                 }
-            })
-        ).with_shared(false);
+            }),
+        )
+        .with_shared(false);
 
         assert!(policy.is_stale());
     }
-    
+
     #[test]
     fn test_max_age_preferred_over_lower_shared_max_age() {
         let policy = CachePolicy::new(
@@ -386,12 +352,13 @@ mod tests {
                     "date": format_date(-2, 60),
                     "cache-control": "s-maxage=60, max-age=180",
                 }
-            })
-        ).with_shared(false);
+            }),
+        )
+        .with_shared(false);
 
         assert_eq!(policy.max_age(), 180);
     }
-    
+
     #[test]
     fn test_max_age_preferred_over_higher_max_age() {
         let policy = CachePolicy::new(
@@ -401,50 +368,52 @@ mod tests {
                     "date": format_date(-3, 60),
                     "cache-control": "s-maxage=60, max-age=180",
                 }
-            })
-        ).with_shared(false);
+            }),
+        )
+        .with_shared(false);
 
         assert!(policy.is_stale());
     }
-    
+
     fn request_method_not_cached(method: String) {
         // 1. seed the cache (potentially)
         // 2. expect a cache hit or miss
         let policy = CachePolicy::new(
             json!({
-                "method": method, 
+                "method": method,
                 "headers": {}
             }),
             json!({
                 "headers": {
                     "expires": format_date(1, 3600),
                 }
-            })
-        ).with_shared(false);
+            }),
+        )
+        .with_shared(false);
 
         assert!(policy.is_stale());
     }
-    
+
     #[test]
     fn test_request_method_options_is_not_cached() {
         request_method_not_cached("OPTIONS".to_string());
     }
-    
+
     #[test]
     fn test_request_method_put_is_not_cached() {
         request_method_not_cached("PUT".to_string());
     }
-    
+
     #[test]
     fn test_request_method_delete_is_not_cached() {
         request_method_not_cached("DELETE".to_string());
     }
-    
+
     #[test]
     fn test_request_method_trace_is_not_cached() {
         request_method_not_cached("TRACE".to_string());
     }
-    
+
     #[test]
     fn test_etag_and_expiration_date_in_the_future() {
         let policy = CachePolicy::new(
@@ -455,12 +424,13 @@ mod tests {
                     "last-modified": format_date(-2, 3600),
                     "expires": format_date(1, 3600),
                 }
-            })
-        ).with_shared(false);
+            }),
+        )
+        .with_shared(false);
 
         assert!(policy.time_to_live() > 0);
     }
-    
+
     #[test]
     fn test_client_side_no_store() {
         let policy = CachePolicy::new(
@@ -473,12 +443,13 @@ mod tests {
                 "headers": {
                     "cache-control": "max-age=60",
                 }
-            })
-        ).with_shared(false);
+            }),
+        )
+        .with_shared(false);
 
         assert_eq!(policy.is_storable(), false);
     }
-    
+
     #[test]
     fn test_request_max_age() {
         let policy = CachePolicy::new(
@@ -489,8 +460,9 @@ mod tests {
                     "date": format_date(-1, 60),
                     "expires": format_date(1, 3600),
                 }
-            })
-        ).with_shared(false);
+            }),
+        )
+        .with_shared(false);
 
         assert_eq!(policy.is_stale(), false);
         assert!(policy.age() >= 60);
@@ -500,7 +472,8 @@ mod tests {
                 "headers": {
                     "cache-control": "max-age=90",
                 },
-            })), true
+            })),
+            true
         );
 
         assert_eq!(
@@ -508,10 +481,11 @@ mod tests {
                 "headers": {
                     "cache-control": "max-age=30",
                 },
-            })), false
+            })),
+            false
         );
     }
-    
+
     #[test]
     fn test_request_min_fresh() {
         let policy = CachePolicy::new(
@@ -520,8 +494,9 @@ mod tests {
                 "headers": {
                     "cache-control": "max-age=60",
                 }
-            })
-        ).with_shared(false);
+            }),
+        )
+        .with_shared(false);
 
         assert_eq!(policy.is_stale(), false);
 
@@ -530,7 +505,8 @@ mod tests {
                 "headers": {
                     "cache-control": "min-fresh=10",
                 },
-            })), true
+            })),
+            true
         );
 
         assert_eq!(
@@ -538,10 +514,11 @@ mod tests {
                 "headers": {
                     "cache-control": "min-fresh=120",
                 },
-            })), false
+            })),
+            false
         );
     }
-    
+
     #[test]
     fn test_request_max_stale() {
         let policy = CachePolicy::new(
@@ -551,8 +528,9 @@ mod tests {
                     "cache-control": "max-age=120",
                     "date": format_date(-4, 60),
                 }
-            })
-        ).with_shared(false);
+            }),
+        )
+        .with_shared(false);
 
         assert!(policy.is_stale());
 
@@ -561,15 +539,17 @@ mod tests {
                 "headers": {
                     "cache-control": "max-stale=180",
                 },
-            })), true
+            })),
+            true
         );
-    
+
         assert_eq!(
             policy.satisfies_without_revalidation(json!({
                 "headers": {
                     "cache-control": "max-stale",
                 },
-            })), true
+            })),
+            true
         );
 
         assert_eq!(
@@ -577,10 +557,11 @@ mod tests {
                 "headers": {
                     "cache-control": "max-stale=10",
                 },
-            })), false
+            })),
+            false
         );
     }
-    
+
     #[test]
     fn test_request_max_stale_not_honored_with_must_revalidate() {
         let policy = CachePolicy::new(
@@ -590,8 +571,9 @@ mod tests {
                     "cache-control": "max-age=120, must-revalidate",
                     "date": format_date(-4, 60),
                 }
-            })
-        ).with_shared(false);
+            }),
+        )
+        .with_shared(false);
 
         assert!(policy.is_stale());
 
@@ -600,7 +582,8 @@ mod tests {
                 "headers": {
                     "cache-control": "max-stale=180",
                 },
-            })), false
+            })),
+            false
         );
 
         assert_eq!(
@@ -608,10 +591,11 @@ mod tests {
                 "headers": {
                     "cache-control": "max-stale",
                 },
-            })), false
+            })),
+            false
         );
     }
-    
+
     #[test]
     fn test_get_headers_deletes_cached_100_level_warnings() {
         let policy = CachePolicy::new(
@@ -620,12 +604,12 @@ mod tests {
                 "headers": {
                     "warning": "199 test danger, 200 ok ok",
                 }
-            })
+            }),
         );
 
         assert_eq!("200 ok ok", policy.response_headers()["warning"]);
     }
-    
+
     #[test]
     fn test_do_not_cache_partial_response() {
         let policy = CachePolicy::new(
@@ -636,19 +620,19 @@ mod tests {
                     "content-range": "bytes 100-100/200",
                     "cache-control": "max-age=60",
                 }
-            })
+            }),
         );
 
         assert_eq!(policy.is_storable(), false);
     }
-    
+
     fn format_date(delta: i64, unit: i64) -> String {
         let now: DateTime<Utc> = Utc::now();
         let result = now.timestamp_nanos() + delta * unit * 1000;
 
         return result.to_string();
     }
-    
+
     #[test]
     fn test_no_store_kills_cache() {
         let policy = CachePolicy::new(
@@ -662,13 +646,13 @@ mod tests {
                 "headers": {
                     "cache-control": "public, max-age=222",
                 }
-            })
+            }),
         );
 
         assert_eq!(policy.is_stale(), true);
         assert_eq!(policy.is_storable(), false);
     }
-    
+
     #[test]
     fn test_post_not_cacheable_by_default() {
         let policy = CachePolicy::new(
@@ -680,13 +664,13 @@ mod tests {
                 "headers": {
                     "cache-control": "public",
                 }
-            })
+            }),
         );
 
         assert_eq!(policy.is_stale(), true);
         assert_eq!(policy.is_storable(), false);
     }
-    
+
     #[test]
     fn test_post_cacheable_explicitly() {
         let policy = CachePolicy::new(
@@ -698,13 +682,13 @@ mod tests {
                 "headers": {
                     "cache-control": "public, max-age=222",
                 }
-            })
+            }),
         );
 
         assert_eq!(policy.is_stale(), false);
         assert_eq!(policy.is_storable(), true);
     }
-    
+
     #[test]
     fn test_public_cacheable_auth_is_ok() {
         let policy = CachePolicy::new(
@@ -718,13 +702,13 @@ mod tests {
                 "headers": {
                     "cache-control": "public, max-age=222",
                 }
-            })
+            }),
         );
 
         assert_eq!(policy.is_stale(), false);
         assert_eq!(policy.is_storable(), true);
     }
-    
+
     #[test]
     fn test_proxy_cacheable_auth_is_ok() {
         let policy = CachePolicy::new(
@@ -738,7 +722,7 @@ mod tests {
                 "headers": {
                     "cache-control": "max-age=0,s-maxage=12",
                 }
-            })
+            }),
         );
 
         assert_eq!(policy.is_stale(), false);
@@ -750,7 +734,7 @@ mod tests {
         assert_eq!(!policy_two.is_stale(), true);
         assert_eq!(policy_two.is_storable(), true);
     }
-    
+
     #[test]
     fn test_private_auth_is_ok() {
         let policy = CachePolicy::new(
@@ -764,13 +748,14 @@ mod tests {
                 "headers": {
                     "cache-control": "max-age=111",
                 }
-            })
-        ).with_shared(false);
+            }),
+        )
+        .with_shared(false);
 
         assert_eq!(policy.is_stale(), false);
         assert_eq!(policy.is_storable(), true);
     }
-    
+
     #[test]
     fn test_revalidate_auth_is_ok() {
         let policy = CachePolicy::new(
@@ -784,12 +769,12 @@ mod tests {
                 "headers": {
                     "cache-control": "max-age=88,must-revalidate",
                 }
-            })
+            }),
         );
 
         assert_eq!(policy.is_storable(), true);
     }
-    
+
     #[test]
     fn test_auth_prevents_caching_by_default() {
         let policy = CachePolicy::new(
@@ -803,13 +788,13 @@ mod tests {
                 "headers": {
                     "cache-control": "max-age=111",
                 }
-            })
+            }),
         );
 
         assert_eq!(policy.is_stale(), true);
         assert_eq!(policy.is_storable(), false);
     }
-    
+
     #[test]
     fn test_simple_miss() {
         let policy = CachePolicy::new(
@@ -817,12 +802,12 @@ mod tests {
                 "method": "GET",
                 "headers": {},
             }),
-            json!({})
+            json!({}),
         );
 
         assert_eq!(policy.is_stale(), true);
     }
-    
+
     #[test]
     fn test_simple_hit() {
         let policy = CachePolicy::new(
@@ -832,13 +817,13 @@ mod tests {
             }),
             json!({
                 "cache-control": "public, max-age=999999"
-            })
+            }),
         );
-        
+
         assert_eq!(policy.is_stale(), false);
         assert_eq!(policy.max_age(), 999999);
     }
-    
+
     #[test]
     fn test_weird_syntax() {
         let policy = CachePolicy::new(
@@ -848,7 +833,7 @@ mod tests {
             }),
             json!({
                 "cache-control": ",,,,max-age =  456      ,"
-            })
+            }),
         );
 
         assert_eq!(policy.is_stale(), false);
@@ -860,7 +845,7 @@ mod tests {
         assert_eq!(policy_two.is_stale(), false);
         assert_eq!(policy_two.max_age(), 456);
     }
-    
+
     #[test]
     fn test_quoted_syntax() {
         let policy = CachePolicy::new(
@@ -870,13 +855,13 @@ mod tests {
             }),
             json!({
                 "cache-control": "  max-age = \"678\"      "
-            })
+            }),
         );
 
         assert_eq!(policy.is_stale(), false);
         assert_eq!(policy.max_age(), 678);
     }
-    
+
     #[test]
     fn test_iis() {
         let policy = CachePolicy::new(
@@ -886,13 +871,14 @@ mod tests {
             }),
             json!({
                 "cache-control": "private, public, max-age=259200"
-            })
-        ).with_shared(false);
+            }),
+        )
+        .with_shared(false);
 
         assert_eq!(policy.is_stale(), false);
         assert_eq!(policy.max_age(), 259200);
     }
-    
+
     #[test]
     fn test_pre_check_tolerated() {
         let cache_control = json!("pre-check=0, post-check=0, no-store, no-cache, max-age=100");
@@ -901,9 +887,7 @@ mod tests {
                 "method": "GET",
                 "headers": {},
             }),
-            json!({
-                "cache-control": cache_control
-            })
+            json!({ "cache-control": cache_control }),
         );
 
         assert_eq!(policy.is_stale(), true);
@@ -911,10 +895,11 @@ mod tests {
         assert_eq!(policy.max_age(), 0);
         assert_eq!(policy.response_headers()["cache-control"], cache_control);
     }
-    
+
     #[test]
     fn test_pre_check_poison() {
-        let original_cache_control = json!("pre-check=0, post-check=0, no-cache, no-store, max-age=100, custom, foo=bar");
+        let original_cache_control =
+            json!("pre-check=0, post-check=0, no-cache, no-store, max-age=100, custom, foo=bar");
         let response = json!({
             "headers": {
                 "cache-control": original_cache_control,
@@ -927,8 +912,8 @@ mod tests {
                 "method": "GET",
                 "headers": {},
             }),
-            response
-        ); 
+            response,
+        );
 
         assert_eq!(policy.is_stale(), false);
         assert_eq!(policy.is_storable(), true);
@@ -937,7 +922,7 @@ mod tests {
         // TODO: None of this works. Not really sure what it is doing.
         // Link to function in JS: https://github.com/kornelski/http-cache-semantics/blob/master/test/responsetest.js#L66
     }
-    
+
     #[test]
     fn test_pre_check_poison_undefined_header() {
         let original_cache_control = json!("pre-check=0, post-check=0, no-cache, no-store");
@@ -953,8 +938,9 @@ mod tests {
                 "method": "GET",
                 "headers": {},
             }),
-            response
-        ).with_ignored_cargo_cult(true);
+            response,
+        )
+        .with_ignored_cargo_cult(true);
 
         assert_eq!(policy.is_stale(), true);
         assert_eq!(policy.is_storable(), true);
@@ -968,7 +954,7 @@ mod tests {
         // assert!(response["headers"]["expires"]);
         // assert!(!policy.response_headers()["expires"]);
     }
-    
+
     #[test]
     fn test_cache_with_expires() {
         let local_time = Local::now();
@@ -982,13 +968,13 @@ mod tests {
                     "date": "TODO: How does time work??", // new Date(now).toGMTString()
                     "expires": "TODO: How does time work??" // new Date(now + 2000).toGMTString()
                 }
-            })
+            }),
         );
 
         assert_eq!(policy.is_stale(), false);
         assert_eq!(policy.max_age(), 2);
     }
-    
+
     #[test]
     fn test_cache_with_expires_always_relative_to_date() {
         let local_time = Local::now();
@@ -1002,12 +988,12 @@ mod tests {
                     "date": "TODO: How does time work??", // new Date(now - 3000).toGMTString()
                     "expires": "TODO: How does time work??" // new Date(now).toGMTString()
                 }
-            })
+            }),
         );
 
         assert_eq!(policy.max_age(), 3);
     }
-    
+
     #[test]
     fn test_cache_expires_no_date() {
         let policy = CachePolicy::new(
@@ -1020,21 +1006,21 @@ mod tests {
                     "cache-control": "public",
                     "expires": "TODO: How does time work??" // new Date(Date.now() + 3600 * 1000).toGMTString()
                 }
-            })
+            }),
         );
 
         assert_eq!(policy.is_stale(), false);
         assert!(policy.max_age() > 3595);
         assert!(policy.max_age() < 3605);
     }
-    
+
     #[test]
     fn test_ages() {
         // TODO: Need to figure out how "subclassing" works in Rust
         // Link to function in JS: https://github.com/kornelski/http-cache-semantics/blob/master/test/responsetest.js#L158
         assert!(false);
     }
-    
+
     #[test]
     fn test_age_can_make_stale() {
         let policy = CachePolicy::new(
@@ -1047,13 +1033,13 @@ mod tests {
                     "cache-control": "max-age=100",
                     "age": "101"
                 }
-            })
+            }),
         );
 
         assert_eq!(policy.is_stale(), true);
         assert_eq!(policy.is_storable(), true);
     }
-    
+
     #[test]
     fn test_age_not_always_stale() {
         let policy = CachePolicy::new(
@@ -1066,13 +1052,13 @@ mod tests {
                     "cache-control": "max-age=20",
                     "age": "15"
                 }
-            })
+            }),
         );
 
         assert_eq!(policy.is_stale(), false);
         assert_eq!(policy.is_storable(), true);
     }
-    
+
     #[test]
     fn test_bogus_age_ignored() {
         let policy = CachePolicy::new(
@@ -1085,13 +1071,13 @@ mod tests {
                     "cache-control": "max-age=20",
                     "age": "golden"
                 }
-            })
+            }),
         );
 
         assert_eq!(policy.is_stale(), false);
         assert_eq!(policy.is_storable(), true);
     }
-    
+
     #[test]
     fn test_cache_old_files() {
         let policy = CachePolicy::new(
@@ -1104,13 +1090,13 @@ mod tests {
                     "date": "TODO: How does time work??", // new Date().toGMTString()
                     "last-modified": "Mon, 07 Mar 2016 11:52:56 GMT"
                 }
-            })
+            }),
         );
 
         assert_eq!(policy.is_stale(), false);
         assert!(policy.max_age() > 100);
     }
-    
+
     #[test]
     fn test_immutable_simple_hit() {
         let policy = CachePolicy::new(
@@ -1122,13 +1108,13 @@ mod tests {
                 "headers": {
                     "cache-control": "immutable, max-age=999999",
                 }
-            })
+            }),
         );
 
         assert_eq!(policy.is_stale(), false);
         assert_eq!(policy.max_age(), 999999);
     }
-    
+
     #[test]
     fn test_immutable_can_expire() {
         let policy = CachePolicy::new(
@@ -1140,13 +1126,13 @@ mod tests {
                 "headers": {
                     "cache-control": "immutable, max-age=0",
                 }
-            })
+            }),
         );
 
         assert_eq!(policy.is_stale(), true);
         assert_eq!(policy.max_age(), 0);
     }
-    
+
     #[test]
     fn test_cache_immutable_files() {
         let policy = CachePolicy::new(
@@ -1160,13 +1146,13 @@ mod tests {
                     "cache-control": "immutable",
                     "last-modified": "TODO: How does time work??", // new Date().toGMTString()
                 }
-            })
+            }),
         );
 
         assert_eq!(policy.is_stale(), false);
         assert!(policy.max_age() > 100);
     }
-    
+
     #[test]
     fn test_immutable_can_be_off() {
         let policy = CachePolicy::new(
@@ -1180,13 +1166,14 @@ mod tests {
                     "cache-control": "immutable",
                     "last-modified": "TODO: How does time work??", // new Date().toGMTString()
                 }
-            })
-        ).with_immutable_min_time_to_live(0);
+            }),
+        )
+        .with_immutable_min_time_to_live(0);
 
         assert_eq!(policy.is_stale(), true);
         assert_eq!(policy.max_age(), 0);
     }
-    
+
     #[test]
     fn test_pragma_no_cache() {
         let policy = CachePolicy::new(
@@ -1197,14 +1184,14 @@ mod tests {
             json!({
                 "headers": {
                     "pragma": "no-cache",
-                    "last-modified": "Mon, 07 Mar 2016 11:52:56 GMT", 
+                    "last-modified": "Mon, 07 Mar 2016 11:52:56 GMT",
                 }
-            })
+            }),
         );
 
         assert_eq!(policy.is_stale(), true);
     }
-    
+
     #[test]
     fn test_blank_cache_control_and_pragma_no_cache() {
         let policy = CachePolicy::new(
@@ -1216,14 +1203,14 @@ mod tests {
                 "headers": {
                     "cache-control": "",
                     "pragma": "no-cache",
-                    "last-modified": "TODO: How does time work??", // new Date().toGMTString() 
+                    "last-modified": "TODO: How does time work??", // new Date().toGMTString()
                 }
-            })
+            }),
         );
 
         assert_eq!(policy.is_stale(), false);
     }
-    
+
     #[test]
     fn test_no_store() {
         let policy = CachePolicy::new(
@@ -1235,13 +1222,13 @@ mod tests {
                 "headers": {
                     "cache-control": "no-store, public, max-age=1",
                 }
-            })
+            }),
         );
 
         assert_eq!(policy.is_stale(), true);
         assert_eq!(policy.max_age(), 0);
     }
-    
+
     #[test]
     fn test_observe_private_cache() {
         let private_header = json!({
@@ -1253,9 +1240,7 @@ mod tests {
                 "method": "GET",
                 "headers": {},
             }),
-            json!({
-                "headers": private_header
-            })
+            json!({ "headers": private_header }),
         );
 
         assert_eq!(proxy_policy.is_stale(), true);
@@ -1266,15 +1251,14 @@ mod tests {
                 "method": "GET",
                 "headers": {},
             }),
-            json!({
-                "headers": private_header
-            })
-        ).with_shared(false);
+            json!({ "headers": private_header }),
+        )
+        .with_shared(false);
 
         assert_eq!(ua_cache.is_stale(), false);
         assert_eq!(ua_cache.max_age(), 1234);
     }
-    
+
     #[test]
     fn test_do_not_share_cookies() {
         let cookie_header = json!({
@@ -1287,10 +1271,9 @@ mod tests {
                 "method": "GET",
                 "headers": {},
             }),
-            json!({
-                "headers": cookie_header
-            })
-        ).with_shared(true);
+            json!({ "headers": cookie_header }),
+        )
+        .with_shared(true);
 
         assert_eq!(proxy_policy.is_stale(), true);
         assert_eq!(proxy_policy.max_age(), 0);
@@ -1300,15 +1283,14 @@ mod tests {
                 "method": "GET",
                 "headers": {},
             }),
-            json!({
-                "headers": cookie_header
-            })
-        ).with_shared(false);
+            json!({ "headers": cookie_header }),
+        )
+        .with_shared(false);
 
         assert_eq!(ua_cache.is_stale(), false);
         assert_eq!(ua_cache.max_age(), 99);
     }
-    
+
     #[test]
     fn test_do_share_cookies_if_immutable() {
         let cookie_header = json!({
@@ -1321,15 +1303,14 @@ mod tests {
                 "method": "GET",
                 "headers": {},
             }),
-            json!({
-                "headers": cookie_header
-            })
-        ).with_shared(true);
+            json!({ "headers": cookie_header }),
+        )
+        .with_shared(true);
 
         assert_eq!(proxy_policy.is_stale(), false);
         assert_eq!(proxy_policy.max_age(), 99);
     }
-    
+
     #[test]
     fn test_cache_explicitly_public_cookie() {
         let cookie_header = json!({
@@ -1342,15 +1323,14 @@ mod tests {
                 "method": "GET",
                 "headers": {},
             }),
-            json!({
-                "headers": cookie_header
-            })
-        ).with_shared(true);
+            json!({ "headers": cookie_header }),
+        )
+        .with_shared(true);
 
         assert_eq!(proxy_policy.is_stale(), false);
         assert_eq!(proxy_policy.max_age(), 5);
     }
-    
+
     #[test]
     fn test_miss_max_age_equals_zero() {
         let policy = CachePolicy::new(
@@ -1362,13 +1342,13 @@ mod tests {
                 "headers": {
                     "cache-control": "public, max-age=0",
                 },
-            })
+            }),
         );
 
         assert_eq!(policy.is_stale(), true);
         assert_eq!(policy.max_age(), 0);
     }
-    
+
     #[test]
     fn test_uncacheable_503() {
         let policy = CachePolicy::new(
@@ -1381,13 +1361,13 @@ mod tests {
                 "headers": {
                     "cache-control": "public, max-age=0",
                 },
-            })
+            }),
         );
 
         assert_eq!(policy.is_stale(), true);
         assert_eq!(policy.max_age(), 0);
     }
-    
+
     #[test]
     fn test_cacheable_301() {
         let policy = CachePolicy::new(
@@ -1400,12 +1380,12 @@ mod tests {
                 "headers": {
                     "last-modified": "Mon, 07 Mar 2016 11:52:56 GMT",
                 },
-            })
+            }),
         );
 
         assert_eq!(policy.is_stale(), false);
     }
-    
+
     #[test]
     fn test_uncacheable_303() {
         let policy = CachePolicy::new(
@@ -1418,13 +1398,13 @@ mod tests {
                 "headers": {
                     "last-modified": "Mon, 07 Mar 2016 11:52:56 GMT",
                 },
-            })
+            }),
         );
 
         assert_eq!(policy.is_stale(), true);
         assert_eq!(policy.max_age(), 0);
     }
-    
+
     #[test]
     fn test_cacheable_303() {
         let policy = CachePolicy::new(
@@ -1437,12 +1417,12 @@ mod tests {
                 "headers": {
                     "cache-control": "max-age=1000",
                 },
-            })
+            }),
         );
 
         assert_eq!(policy.is_stale(), false);
     }
-    
+
     #[test]
     fn test_uncacheable_412() {
         let policy = CachePolicy::new(
@@ -1455,13 +1435,13 @@ mod tests {
                 "headers": {
                     "cache-control": "public, max-age=1000",
                 },
-            })
+            }),
         );
 
         assert_eq!(policy.is_stale(), true);
         assert_eq!(policy.max_age(), 0);
     }
-    
+
     #[test]
     fn test_expired_expires_cache_with_max_age() {
         let policy = CachePolicy::new(
@@ -1474,13 +1454,13 @@ mod tests {
                     "cache-control": "public, max-age=9999",
                     "expires": "Sat, 07 May 2016 15:35:18 GMT",
                 },
-            })
+            }),
         );
 
         assert_eq!(policy.is_stale(), false);
         assert_eq!(policy.max_age(), 9999);
     }
-    
+
     #[test]
     fn test_expired_expires_cached_with_s_maxage() {
         let s_max_age_headers = json!({
@@ -1495,7 +1475,7 @@ mod tests {
             }),
             json!({
                 "headers": s_max_age_headers,
-            })
+            }),
         );
 
         assert_eq!(proxy_policy.is_stale(), false);
@@ -1508,13 +1488,14 @@ mod tests {
             }),
             json!({
                 "headers": s_max_age_headers,
-            })
-        ).with_shared(false);
+            }),
+        )
+        .with_shared(false);
 
         assert_eq!(ua_policy.is_stale(), true);
         assert_eq!(ua_policy.max_age(), 0);
     }
-    
+
     #[test]
     fn test_max_age_wins_over_future_expires() {
         let policy = CachePolicy::new(
@@ -1527,18 +1508,18 @@ mod tests {
                     "cache-control": "public, max-age=333",
                     "expires": "How does time work???", // new Date(Date.now() + 3600 * 1000).toGMTString()
                 },
-            })
+            }),
         );
 
         assert_eq!(policy.is_stale(), false);
         assert_eq!(policy.max_age(), 333);
     }
-    
+
     #[test]
     fn test_remove_hop_headers() {
         // TODO: Need to figure out how "subclassing" works in Rust
         // Link to JavaScript function: https://github.com/kornelski/http-cache-semantics/blob/master/test/responsetest.js#L472
-    }    
+    }
 
     lazy_static! {
         static ref SIMPLE_REQUEST_REVALIDATE: Value = {
@@ -1550,107 +1531,107 @@ mod tests {
                     "x-custom": "yes",
                 },
                 "url": "/Protocols/rfc2616/rfc2616-sec14.html",
-            }); 
+            });
 
             return request;
         };
     }
-    
+
     fn assert_headers_passed(headers: Value) {
         assert_eq!(headers["connection"], json!(null));
         assert_eq!(headers["x-custom"], "yes");
     }
-    
+
     fn assert_no_validators(headers: Value) {
         assert_eq!(headers["if-none-match"], json!(null));
         assert_eq!(headers["if-modified-since"], json!(null));
     }
-    
+
     #[test]
     fn test_ok_if_method_changes_to_head() {
         assert!(false);
     }
-    
+
     #[test]
     fn test_not_if_method_mismatch_other_than_head() {
         assert!(false);
     }
-    
+
     #[test]
     fn test_not_if_url_mismatch() {
         assert!(false);
     }
-    
+
     #[test]
     fn test_not_if_host_mismatch() {
         assert!(false);
     }
-    
+
     #[test]
     fn test_not_if_vary_fields_prevent() {
         assert!(false);
     }
-    
+
     #[test]
     fn test_when_entity_tag_validator_is_present() {
         assert!(false);
     }
-    
+
     #[test]
     fn test_skips_weak_validators_on_post_2() {
         assert!(false);
     }
-    
+
     #[test]
     fn test_merges_validators() {
         assert!(false);
     }
-    
+
     #[test]
     fn test_when_last_modified_validator_is_present() {
         assert!(false);
     }
-    
+
     #[test]
     fn test_not_without_validators() {
         assert!(false);
     }
-    
+
     #[test]
     fn test_113_added() {
         assert!(false);
     }
-    
+
     #[test]
     fn test_removes_warnings() {
         assert!(false);
     }
-    
+
     #[test]
     fn test_must_contain_any_etag() {
         assert!(false);
     }
-    
+
     #[test]
     fn test_merges_etags() {
         assert!(false);
     }
-    
+
     #[test]
     fn test_should_send_the_last_modified_value() {
         assert!(false);
     }
-    
+
     #[test]
     fn test_should_not_send_the_last_modified_value_for_post() {
         assert!(false);
     }
-    
+
     #[test]
     fn test_should_not_send_the_last_modified_value_for_range_request() {
         assert!(false);
     }
-    
+
     #[test]
     fn test_when_urls_match() {
         let policy = CachePolicy::new(
@@ -1663,15 +1644,18 @@ mod tests {
                 "headers": {
                     "cache-control": "max-age=2",
                 },
-            })
+            }),
         );
 
-        assert_eq!(policy.satisfies_without_revalidation(json!({
-            "url": "/",
-            "headers": {},
-        })), true);
+        assert_eq!(
+            policy.satisfies_without_revalidation(json!({
+                "url": "/",
+                "headers": {},
+            })),
+            true
+        );
     }
-    
+
     #[test]
     fn test_when_expires_is_present() {
         let policy = CachePolicy::new(
@@ -1683,14 +1667,17 @@ mod tests {
                 "headers": {
                     "expires": "How does time work??", // new Date(Date.now() + 2000).toGMTString()
                 },
-            })
+            }),
         );
 
-        assert_eq!(policy.satisfies_without_revalidation(json!({
-            "headers": {},
-        })), true);
+        assert_eq!(
+            policy.satisfies_without_revalidation(json!({
+                "headers": {},
+            })),
+            true
+        );
     }
-    
+
     #[test]
     fn test_not_when_urls_mismatch() {
         let policy = CachePolicy::new(
@@ -1703,15 +1690,18 @@ mod tests {
                 "headers": {
                     "cache-control": "max-age=2",
                 },
-            })
+            }),
         );
 
-        assert_eq!(policy.satisfies_without_revalidation(json!({
-            "url": "/foo?bar",
-            "headers": {},
-        })), true);
+        assert_eq!(
+            policy.satisfies_without_revalidation(json!({
+                "url": "/foo?bar",
+                "headers": {},
+            })),
+            true
+        );
     }
-    
+
     #[test]
     fn test_when_methods_match() {
         let policy = CachePolicy::new(
@@ -1724,15 +1714,18 @@ mod tests {
                 "headers": {
                     "cache-control": "'max-age=2",
                 },
-            })
+            }),
         );
 
-        assert_eq!(policy.satisfies_without_revalidation(json!({
-            "method": "GET",
-            "headers": {},
-        })), true);
+        assert_eq!(
+            policy.satisfies_without_revalidation(json!({
+                "method": "GET",
+                "headers": {},
+            })),
+            true
+        );
     }
-    
+
     #[test]
     fn test_not_when_hosts_mismatch() {
         let policy = CachePolicy::new(
@@ -1746,22 +1739,28 @@ mod tests {
                 "headers": {
                     "cache-control": "max-age=2",
                 },
-            })
+            }),
         );
 
-        assert_eq!(policy.satisfies_without_revalidation(json!({
-            "headers": {
-                "host": "foo",
-            },
-        })), true);
+        assert_eq!(
+            policy.satisfies_without_revalidation(json!({
+                "headers": {
+                    "host": "foo",
+                },
+            })),
+            true
+        );
 
-        assert_eq!(policy.satisfies_without_revalidation(json!({
-            "headers": {
-                "host": "foofoo",
-            },
-        })), true);
+        assert_eq!(
+            policy.satisfies_without_revalidation(json!({
+                "headers": {
+                    "host": "foofoo",
+                },
+            })),
+            true
+        );
     }
-    
+
     #[test]
     fn test_when_methods_match_head() {
         let policy = CachePolicy::new(
@@ -1774,15 +1773,18 @@ mod tests {
                 "headers": {
                     "cache-control": "max-age=2",
                 },
-            })
+            }),
         );
 
-        assert_eq!(policy.satisfies_without_revalidation(json!({
-            "method": "HEAD",
-            "headers": {},
-        })), true);
+        assert_eq!(
+            policy.satisfies_without_revalidation(json!({
+                "method": "HEAD",
+                "headers": {},
+            })),
+            true
+        );
     }
-    
+
     #[test]
     fn test_not_when_methods_mismatch() {
         let policy = CachePolicy::new(
@@ -1795,15 +1797,18 @@ mod tests {
                 "headers": {
                     "cache-control": "max-age=2",
                 },
-            })
+            }),
         );
 
-        assert_eq!(policy.satisfies_without_revalidation(json!({
-            "method": "GET",
-            "headers": {},
-        })), true);
+        assert_eq!(
+            policy.satisfies_without_revalidation(json!({
+                "method": "GET",
+                "headers": {},
+            })),
+            true
+        );
     }
-    
+
     #[test]
     fn test_not_when_methods_mismatch_head() {
         let policy = CachePolicy::new(
@@ -1816,15 +1821,18 @@ mod tests {
                 "headers": {
                     "cache-control": "max-age=2",
                 },
-            })
+            }),
         );
 
-        assert_eq!(policy.satisfies_without_revalidation(json!({
-            "method": "GET",
-            "headers": {},
-        })), false);
+        assert_eq!(
+            policy.satisfies_without_revalidation(json!({
+                "method": "GET",
+                "headers": {},
+            })),
+            false
+        );
     }
-    
+
     #[test]
     fn test_not_when_proxy_revalidating() {
         let policy = CachePolicy::new(
@@ -1836,14 +1844,17 @@ mod tests {
                 "headers": {
                     "cache-control": "max-age=2, proxy-revalidate ",
                 },
-            })
+            }),
         );
 
-        assert_eq!(policy.satisfies_without_revalidation(json!({
-            "headers": {},
-        })), false);
+        assert_eq!(
+            policy.satisfies_without_revalidation(json!({
+                "headers": {},
+            })),
+            false
+        );
     }
-    
+
     #[test]
     fn test_when_not_a_proxy_revalidating() {
         let policy = CachePolicy::new(
@@ -1855,14 +1866,18 @@ mod tests {
                 "headers": {
                     "cache-control": "max-age=2, proxy-revalidate ",
                 },
-            })
-        ).with_shared(false);
+            }),
+        )
+        .with_shared(false);
 
-        assert_eq!(policy.satisfies_without_revalidation(json!({
-            "headers": {},
-        })), true);
+        assert_eq!(
+            policy.satisfies_without_revalidation(json!({
+                "headers": {},
+            })),
+            true
+        );
     }
-    
+
     #[test]
     fn test_not_when_no_cache_requesting() {
         let policy = CachePolicy::new(
@@ -1873,26 +1888,36 @@ mod tests {
                 "headers": {
                     "cache-control": "max-age=2",
                 },
-            })
-        ).with_shared(false);
+            }),
+        )
+        .with_shared(false);
 
-        assert_eq!(policy.satisfies_without_revalidation(json!({
-            "headers": {
-                "cache-control": "fine",
-            },
-        })), true);
+        assert_eq!(
+            policy.satisfies_without_revalidation(json!({
+                "headers": {
+                    "cache-control": "fine",
+                },
+            })),
+            true
+        );
 
-        assert_eq!(policy.satisfies_without_revalidation(json!({
-            "headers": {
-                "cache-control": "no-cache",
-            },
-        })), false);
+        assert_eq!(
+            policy.satisfies_without_revalidation(json!({
+                "headers": {
+                    "cache-control": "no-cache",
+                },
+            })),
+            false
+        );
 
-        assert_eq!(policy.satisfies_without_revalidation(json!({
-            "headers": {
-                "cache-control": "no-cache",
-            },
-        })), false);
+        assert_eq!(
+            policy.satisfies_without_revalidation(json!({
+                "headers": {
+                    "cache-control": "no-cache",
+                },
+            })),
+            false
+        );
     }
 
     lazy_static! {
@@ -1904,7 +1929,7 @@ mod tests {
                     "connection": "close",
                 },
                 "url": "/Protocols/rfc2616/rfc2616-sec14.html",
-            }); 
+            });
 
             return simple_request;
         };
@@ -1925,61 +1950,61 @@ mod tests {
     fn not_modified_response_headers() {
         assert!(false);
     }
-    
+
     fn assert_updates() {
         assert!(false);
     }
-    
+
     #[test]
     fn test_matching_etags_are_updated() {
         assert!(false);
     }
-    
+
     #[test]
     fn test_matching_weak_etags_are_updated() {
         assert!(false);
     }
-    
+
     #[test]
     fn test_matching_last_mod_are_updated() {
         assert!(false);
     }
-    
+
     #[test]
     fn test_both_matching_are_updated() {
         assert!(false);
     }
-    
+
     #[test]
     fn test_check_status() {
         assert!(false);
     }
-    
+
     #[test]
     fn test_last_mod_ignored_if_etag_is_wrong() {
         assert!(false);
     }
-    
+
     #[test]
     fn test_ignored_if_validator_is_missing() {
         assert!(false);
     }
-    
+
     #[test]
     fn test_skips_update_of_content_length() {
         assert!(false);
     }
-    
+
     #[test]
     fn test_ignored_if_validator_is_different() {
         assert!(false);
     }
-    
+
     #[test]
     fn test_ignored_if_validator_does_not_match() {
         assert!(false);
     }
-    
+
     #[test]
     fn test_vary_basic() {
         let policy = CachePolicy::new(
@@ -1993,22 +2018,28 @@ mod tests {
                     "cache-control": "max-age=5",
                     "vary": "weather",
                 },
-            })
+            }),
         );
 
-        assert_eq!(policy.satisfies_without_revalidation(json!({
-            "headers": {
-                "weather": "nice",
-            },
-        })), true);
+        assert_eq!(
+            policy.satisfies_without_revalidation(json!({
+                "headers": {
+                    "weather": "nice",
+                },
+            })),
+            true
+        );
 
-        assert_eq!(policy.satisfies_without_revalidation(json!({
-            "headers": {
-                "weather": "bad",
-            },
-        })), false);
+        assert_eq!(
+            policy.satisfies_without_revalidation(json!({
+                "headers": {
+                    "weather": "bad",
+                },
+            })),
+            false
+        );
     }
-    
+
     #[test]
     fn test_asterisks_does_not_match() {
         let policy = CachePolicy::new(
@@ -2022,16 +2053,19 @@ mod tests {
                     "cache-control": "max-age=5",
                     "vary": "*",
                 },
-            })
+            }),
         );
 
-        assert_eq!(policy.satisfies_without_revalidation(json!({
-            "headers": {
-                "weather": "ok",
-            },
-        })), false);
+        assert_eq!(
+            policy.satisfies_without_revalidation(json!({
+                "headers": {
+                    "weather": "ok",
+                },
+            })),
+            false
+        );
     }
-    
+
     #[test]
     fn test_asterisks_is_stale() {
         let policy_one = CachePolicy::new(
@@ -2045,7 +2079,7 @@ mod tests {
                     "cache-control": "public,max-age=99",
                     "vary": "*",
                 },
-            })
+            }),
         );
 
         let policy_two = CachePolicy::new(
@@ -2059,13 +2093,13 @@ mod tests {
                     "cache-control": "public,max-age=99",
                     "vary": "weather",
                 },
-            })
+            }),
         );
 
         assert_eq!(policy_one.is_stale(), true);
         assert_eq!(policy_two.is_stale(), false);
     }
-    
+
     #[test]
     fn test_values_are_case_sensitive() {
         let policy = CachePolicy::new(
@@ -2079,22 +2113,28 @@ mod tests {
                     "cache-control": "public,max-age=5",
                     "vary": "Weather",
                 },
-            })
+            }),
         );
 
-        assert_eq!(policy.satisfies_without_revalidation(json!({
-            "headers": {
-                "weather": "BAD",
-            },
-        })), true);
+        assert_eq!(
+            policy.satisfies_without_revalidation(json!({
+                "headers": {
+                    "weather": "BAD",
+                },
+            })),
+            true
+        );
 
-        assert_eq!(policy.satisfies_without_revalidation(json!({
-            "headers": {
-                "weather": "bad",
-            },
-        })), false);
+        assert_eq!(
+            policy.satisfies_without_revalidation(json!({
+                "headers": {
+                    "weather": "bad",
+                },
+            })),
+            false
+        );
     }
-    
+
     #[test]
     fn test_irrelevant_headers_ignored() {
         let policy = CachePolicy::new(
@@ -2108,28 +2148,37 @@ mod tests {
                     "cache-control": "max-age=5",
                     "vary": "moon-phase",
                 },
-            })
+            }),
         );
 
-        assert_eq!(policy.satisfies_without_revalidation(json!({
-            "headers": {
-                "weather": "bad",
-            },
-        })), true);
+        assert_eq!(
+            policy.satisfies_without_revalidation(json!({
+                "headers": {
+                    "weather": "bad",
+                },
+            })),
+            true
+        );
 
-        assert_eq!(policy.satisfies_without_revalidation(json!({
-            "headers": {
-                "weather": "shining",
-            },
-        })), true);
+        assert_eq!(
+            policy.satisfies_without_revalidation(json!({
+                "headers": {
+                    "weather": "shining",
+                },
+            })),
+            true
+        );
 
-        assert_eq!(policy.satisfies_without_revalidation(json!({
-            "headers": {
-                "moon-phase": "full",
-            },
-        })), false);
+        assert_eq!(
+            policy.satisfies_without_revalidation(json!({
+                "headers": {
+                    "moon-phase": "full",
+                },
+            })),
+            false
+        );
     }
-    
+
     #[test]
     fn test_absence_is_meaningful() {
         let policy = CachePolicy::new(
@@ -2143,27 +2192,36 @@ mod tests {
                     "cache-control": "max-age=5",
                     "vary": "moon-phase, weather",
                 },
-            })
+            }),
         );
-        
-        assert_eq!(policy.satisfies_without_revalidation(json!({
-            "headers": {
-                "weather": "nice",
-            },
-        })), true);
 
-        assert_eq!(policy.satisfies_without_revalidation(json!({
-            "headers": {
-                "weather": "nice",
-                "moon-phase": "",
-            },
-        })), false);
+        assert_eq!(
+            policy.satisfies_without_revalidation(json!({
+                "headers": {
+                    "weather": "nice",
+                },
+            })),
+            true
+        );
 
-        assert_eq!(policy.satisfies_without_revalidation(json!({
-            "headers": {},
-        })), false);
+        assert_eq!(
+            policy.satisfies_without_revalidation(json!({
+                "headers": {
+                    "weather": "nice",
+                    "moon-phase": "",
+                },
+            })),
+            false
+        );
+
+        assert_eq!(
+            policy.satisfies_without_revalidation(json!({
+                "headers": {},
+            })),
+            false
+        );
     }
-    
+
     #[test]
     fn test_all_values_must_match() {
         let policy = CachePolicy::new(
@@ -2178,24 +2236,30 @@ mod tests {
                     "cache-control": "max-age=5",
                     "vary": "weather, sun",
                 },
-            })
+            }),
         );
 
-        assert_eq!(policy.satisfies_without_revalidation(json!({
-            "headers": {
-                "sun": "shining",
-                "weather": "nice",
-            },
-        })), true);
+        assert_eq!(
+            policy.satisfies_without_revalidation(json!({
+                "headers": {
+                    "sun": "shining",
+                    "weather": "nice",
+                },
+            })),
+            true
+        );
 
-        assert_eq!(policy.satisfies_without_revalidation(json!({
-            "headers": {
-                "sun": "shining",
-                "weather": "bad",
-            },
-        })), false);
+        assert_eq!(
+            policy.satisfies_without_revalidation(json!({
+                "headers": {
+                    "sun": "shining",
+                    "weather": "bad",
+                },
+            })),
+            false
+        );
     }
-    
+
     #[test]
     fn test_whitespace_is_okay() {
         let policy = CachePolicy::new(
@@ -2210,29 +2274,38 @@ mod tests {
                     "cache-control": "max-age=5",
                     "vary": "    weather       ,     sun     ",
                 },
-            })
+            }),
         );
 
-        assert_eq!(policy.satisfies_without_revalidation(json!({
-            "headers": {
-                "sun": "shining",
-                "weather": "nice",
-            },
-        })), true);
+        assert_eq!(
+            policy.satisfies_without_revalidation(json!({
+                "headers": {
+                    "sun": "shining",
+                    "weather": "nice",
+                },
+            })),
+            true
+        );
 
-        assert_eq!(policy.satisfies_without_revalidation(json!({
-            "headers": {
-                "weather": "nice",
-            },
-        })), false);
+        assert_eq!(
+            policy.satisfies_without_revalidation(json!({
+                "headers": {
+                    "weather": "nice",
+                },
+            })),
+            false
+        );
 
-        assert_eq!(policy.satisfies_without_revalidation(json!({
-            "headers": {
-                "sun": "shining",
-            },
-        })), false);
+        assert_eq!(
+            policy.satisfies_without_revalidation(json!({
+                "headers": {
+                    "sun": "shining",
+                },
+            })),
+            false
+        );
     }
-    
+
     #[test]
     fn test_order_is_irrelevant() {
         let policy_one = CachePolicy::new(
@@ -2247,7 +2320,7 @@ mod tests {
                     "cache-control": "max-age=5",
                     "vary": "weather, sun",
                 },
-            })
+            }),
         );
 
         let policy_two = CachePolicy::new(
@@ -2262,51 +2335,62 @@ mod tests {
                     "cache-control": "max-age=5",
                     "vary": "sun, weather",
                 },
-            })
+            }),
         );
 
-        assert_eq!(policy_one.satisfies_without_revalidation(json!({
-            "headers": {
-                "weather": "nice",
-                "sun": "shining",
-            },
-        })), true);
-        
-        assert_eq!(policy_one.satisfies_without_revalidation(json!({
-            "headers": {
-                "sun": "shining",
-                "weather": "nice",
-            },
-        })), true);
+        assert_eq!(
+            policy_one.satisfies_without_revalidation(json!({
+                "headers": {
+                    "weather": "nice",
+                    "sun": "shining",
+                },
+            })),
+            true
+        );
 
-        assert_eq!(policy_two.satisfies_without_revalidation(json!({
-            "headers": {
-                "weather": "nice",
-                "sun": "shining",
-            },
-        })), true);
+        assert_eq!(
+            policy_one.satisfies_without_revalidation(json!({
+                "headers": {
+                    "sun": "shining",
+                    "weather": "nice",
+                },
+            })),
+            true
+        );
 
-        assert_eq!(policy_two.satisfies_without_revalidation(json!({
-            "headers": {
-                "sun": "shining",
-                "weather": "nice",
-            },
-        })), true);
+        assert_eq!(
+            policy_two.satisfies_without_revalidation(json!({
+                "headers": {
+                    "weather": "nice",
+                    "sun": "shining",
+                },
+            })),
+            true
+        );
+
+        assert_eq!(
+            policy_two.satisfies_without_revalidation(json!({
+                "headers": {
+                    "sun": "shining",
+                    "weather": "nice",
+                },
+            })),
+            true
+        );
     }
-    
+
     #[test]
     fn test_thaw_wrong_object() {
         assert!(false);
     }
-    
+
     #[test]
     fn test_missing_headers() {
         assert!(false);
     }
-    
+
     #[test]
     fn test_github_response_with_small_clock_skew() {
         assert!(false);
     }
-    
-}    
+}
