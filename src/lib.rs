@@ -8,7 +8,9 @@
 use http::request::Parts as Request;
 use http::response::Parts as Response;
 use lazy_static::lazy_static;
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
+use serde_json::Value;
+use http::{StatusCode, Version, HeaderMap, HeaderValue, Extensions, Method, Uri};
 
 lazy_static! {
     static ref STATUS_CODE_CACHEABLE_BY_DEFAULT: HashSet<i32> = {
@@ -126,11 +128,30 @@ impl Default for CacheOptions {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "Response")]
+struct ResponsePartsDef {
+    status: StatusCode,
+    version: Version,
+    headers: HeaderMap<HeaderValue>,
+    extensions: Extensions,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "Request")]
+struct RequestPartsDef {
+    method: Method,
+    uri: Uri,
+}
+
 /// Identifies when responses can be reused from a cache, taking into account HTTP RFC 7234 rules
 /// for user agents and shared caches. It's aware of many tricky details such as the Vary header,
 /// proxy revalidation, and authenticated responses.
 #[derive(Debug)]
-pub struct CachePolicy;
+pub struct CachePolicy {
+    request: Request,
+    response: Response,
+}
 
 impl CacheOptions {
     /// Cacheability of an HTTP response depends on how it was requested, so both request and
@@ -141,6 +162,26 @@ impl CacheOptions {
 }
 
 impl CachePolicy {
+    pub fn new(request: Value, response: Value) -> Self {
+        CachePolicy {
+            request: Request {
+                method: "GET",
+                uri: "http://jobby.com",
+                version: "42",
+                headers: "headers",
+                extensions: "extensions",
+                _priv: ()
+            },
+            response: Response {
+                status: StatusCode::from_u16(),
+                version: "42",
+                headers: "headers",
+                extensions: "extensions",
+                _priv: ()
+            }
+        }
+    }
+
     /// Returns `true` if the response can be stored in a cache. If it's `false` then you MUST NOT
     /// store either the request or the response.
     pub fn is_storable(&self) -> bool {
@@ -194,6 +235,42 @@ impl CachePolicy {
     /// client. This function is necessary, because proxies MUST always remove hop-by-hop headers
     /// (such as TE and Connection) and update response's Age to avoid doubling cache time.
     pub fn update_response_headers(&self, headers: &mut Response) {
+        unimplemented!();
+    }
+
+    pub fn satisfies_without_revalidation(&self, payload: Value) -> bool {
+        unimplemented!();
+    }
+
+    pub fn is_stale(&self) -> bool {
+        unimplemented!();
+    }
+
+    pub fn max_age(&self) -> u32 {
+        unimplemented!();
+    }
+
+    pub fn with_shared(&self, is_shared: bool) -> Self {
+        unimplemented!();
+    }
+
+    pub fn with_immutable_min_time_to_live(&self, min_time: u32) -> Self {
+        unimplemented!();
+    }
+
+    pub fn with_ignored_cargo_cult(&self, is_ignored: bool) -> Self {
+        unimplemented!();
+    }
+
+    pub fn from_object(hash: HashMap<String, String>) -> Self {
+        unimplemented!();
+    }
+
+    pub fn age(&self) -> u32 {
+        unimplemented!();
+    }
+
+    pub fn response_headers(&self) -> HashMap<String, String> {
         unimplemented!();
     }
 }
